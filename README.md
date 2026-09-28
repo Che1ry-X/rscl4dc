@@ -1,408 +1,400 @@
-# PlusResUNet：爆轰胞格边界分割与尺寸测量
+﻿# 爆轰三波点轨迹线：ResUNet + clDice（全512训练版）
 
-基于 PyTorch 的端到端图像分析流程：用残差 U-Net 分割爆轰胞格边界，再通过概率增强、形态学清理、骨架化和闭合区域分析，对胞格进行编号并换算真实尺寸。
+这是原 PlusResUNet 项目的拓扑约束更新版。网络仍采用残差 U-Net，但训练目标引入
+**centerline Dice（clDice）**，使模型在关注像素重叠的同时，更直接地约束细轨迹线的连通性和胞格拓扑。
 
-> `PlusResUNet` 是本项目的内部名称。这里实现的是“U-Net 编解码器 + ResNet 风格残差块”的单输出边界分割网络，并非对某篇同名网络论文的逐层复现，也不同于包含 ASPP、注意力和 SE 模块的 ResUNet++。
+当前训练配置已经取消1024图块，训练和验证全部使用512×512图块，
+默认 batch-size=2，以降低显存压力。
 
-## 项目亮点
+## 本次更新与原版对比
 
-- 同时使用 `256×256` 与 `512×512` patch，兼顾局部细线和大尺度结构。
-- 通过三波点、骨架带和连接区域进行重点采样与空间加权。
-- 自定义复合损失：加权 BCE、Focal Tversky、Soft Dice 与胞格内部假阳性惩罚。
-- 支持 5 折图像级交叉验证、AdamW 和余弦退火。
-- 使用重叠滑窗推理，适配任意尺寸图像。
-- 自动输出概率图、二值边界、骨架、结构编号、叠加图及真实尺寸 CSV。
-- 仓库附带清理后的最佳检查点、代表性可视化和一份测量结果表。
+| 项目 | 原 PlusResUNet | 当前 ResUNet + clDice |
+| --- | --- | --- |
+| 输入 | RGB 三通道 | 归一化灰度单通道 |
+| 主监督信号 | 边界 mask + 三波点图 | 轨迹线 mask，不再要求三波点图 |
+| 损失函数 | 加权 BCE + Focal Tversky + Soft Dice + 胞格内部假阳性惩罚 | `0.3 BCE + 0.3 Dice + 0.4 clDice` |
+| 拓扑约束 | 间接由空间权重和内部惩罚提供 | 通过可微骨架化和 clDice 直接约束连通性 |
+| Patch | 256×256 与 512×512 混合 | 统一 512×512 |
+| 抽样 | 不同尺度分别按图采样 | 每张图获得近乎相同的样本数，70% 前景引导 |
+| 验证 | 5 折图像级交叉验证 | 默认 80/20 图像级固定划分 |
+| 最佳模型 | 综合 score 最高的单折模型 | 验证 Dice 最高的 `best.pt` |
+| 评估 | Dice、Precision、Recall、Interior FP | 新增 clDice、IoU、Specificity、Balanced Accuracy 等逐图指标 |
+| 几何输出 | 高、宽、面积 | 高、宽、面积，并新增周长 |
+| 代码结构 | 训练/预测两个大脚本 | 拆分为数据、模型、损失、指标、后处理、训练和预测模块 |
 
-## 代表性结果
+原版代码、权重和结果仍保留在 Git 历史的 `5489b56` 提交中，可用于完整回溯和对比。
 
-下图来自仓库中保存的一次推理结果。白色区域为预测边界，彩色区域为检测到的闭合胞格，数字为结构 ID。
+## 主要功能
 
-![PlusResUNet 胞格分割与编号叠加结果](docs/assets/example_overlay.jpg)
+1. ResUNet残差分割网络；
+2. 损失函数为0.3 BCE + 0.3 Dice + 0.4 clDice；
+3. 所有训练图块固定为512×512；
+4. 每张训练图的采样次数均衡，最大相差不超过1次；
+5. 训练时默认batch-size=2；
+6. 预测输出概率图、二值图、1 px骨架和闭合结构彩色图；
+7. 统计闭合结构上下距离、左右距离、面积和周长；
+8. 提供真值mask时，逐图输出Dice、clDice、Recall等指标。
 
-对应的纯实例编号图：
+## 目录约定
 
-![PlusResUNet 闭合胞格实例图](docs/assets/example_instances.png)
+远程主机建议保持以下结构：
 
-### 已保存结果的统计
+~~~text
+$HOME/CR/
+├── plusresunet/
+└── train/
+    ├── original/
+    ├── mask/
+    └── predict/
+~~~
 
-[`results/all_measurements.csv`](results/all_measurements.csv) 包含当前保留的一组测量结果。CSV 中共有 124 个闭合结构，来自 10 个出现有效检测结果的图像文件。
+本版本结果固定分类保存为：
 
-| 指标 | 数值 |
-| --- | ---: |
-| 闭合结构数 | 124 |
-| 有检测结果的图像数 | 10 |
-| 平均上下尺寸 | 22.6517 mm |
-| 平均左右尺寸 | 34.1455 mm |
-| 平均面积 | 453.0908 mm² |
-| 面积中位数 | 375.5385 mm² |
-| 面积范围 | 7.1854–2142.9138 mm² |
+~~~text
+$HOME/CR/plusresunet/runs/resunet_cl/
+$HOME/CR/plusresunet/predict_results_resunet_cl/
+~~~
 
-这些数值是对已保存 CSV 的描述性统计，不代表独立测试集性能。物理尺寸直接依赖推理时设置的 `--pixel-per-mm`；改变标定比例会同步改变长度和面积。
+## 运行环境
 
-### 最佳检查点的验证指标
+目标环境：
 
-仓库中的 [`weights/best_model.pt`](weights/best_model.pt) 来自第 5 折的最佳 epoch。检查点记录的验证指标如下：
+~~~text
+Python       3.7.16
+PyTorch      1.2.0
+CUDA         10.0
+Pillow       9.4.0
+scikit-image 0.19.3
+SciPy        1.7.3
+~~~
 
-| 指标 | 数值 |
-| --- | ---: |
-| Dice | 0.5986 |
-| Precision | 0.4705 |
-| Recall | 0.8240 |
-| Interior FP | 0.1489 |
-| 综合 score | 0.5744 |
-| Validation loss | 0.7813 |
+代码使用FP32，不使用AMP，也不使用新版DataLoader参数。不要重新安装
+PyTorch，以免破坏现有CUDA环境。
 
-综合分数定义为：
+安装其余依赖：
 
-$$
-\text{score}=0.55\,\text{Dice}+0.25\,\text{Precision}
-+0.20\,\text{Recall}-0.25\,\text{InteriorFP}.
-$$
-
-验证使用随机裁剪 patch，而不是固定的完整图像测试集，因此这些指标主要用于模型选择，不应直接当作严格的最终泛化性能。
-
-## 工作流程
-
-```mermaid
-flowchart LR
-    subgraph Training[训练]
-        A[RGB 原图] --> D[监督图构造]
-        B[边界 Mask] --> D
-        C[三波点图] --> D
-        D --> E[256 / 512 混合 Patch]
-        E --> F[PlusResUNet]
-        F --> G[BoundaryLoss]
-        G --> H[5 折交叉验证]
-        H --> I[最佳检查点]
-    end
-
-    subgraph Inference[推理与测量]
-        J[待预测图像] --> K[重叠滑窗推理]
-        I --> K
-        K --> L[概率增强与二值化]
-        L --> M[形态学清理]
-        M --> N[骨架化与短枝剪除]
-        N --> O[闭合区域标记]
-        O --> P[编号图 / 叠加图 / CSV]
-    end
-```
-
-## 仓库结构
-
-```text
-plusresunet/
-├─ train_plusresunet.py       # 数据处理、模型、损失、验证和训练
-├─ predict_plusresunet.py     # 滑窗推理、后处理、编号和尺寸测量
-├─ requirements.txt           # Python 依赖
-├─ weights/
-│  └─ best_model.pt           # 清理本机路径元数据后的最佳检查点
-├─ results/
-│  └─ all_measurements.csv    # 保留的一组测量汇总
-├─ docs/assets/
-│  ├─ example_overlay.jpg     # README 代表性叠加结果
-│  └─ example_instances.png   # README 代表性实例编号图
-├─ __init__.py
-└─ README.md
-```
-
-原始训练数据、完整推理输出、缓存、重复副本和每折检查点未提交到仓库；它们已由 `.gitignore` 排除。
-
-## 安装
-
-```bash
+~~~bash
 git clone https://github.com/Che1ry-X/plusresunet.git
 cd plusresunet
-python -m venv .venv
-```
+conda activate SKESEG
+pip install -r requirements.txt
+~~~
 
-Windows PowerShell：
+## 快速测试
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
+正式训练前先运行：
 
-Linux / macOS：
+~~~bash
+conda activate SKESEG
+cd $HOME/CR/plusresunet
+python quick_test.py
+~~~
 
-```bash
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
+快速测试检查：
 
-依赖包括 `torch`、`numpy`、`pillow` 和 `scikit-image`。`requirements.txt` 当前未锁定具体版本；如需严格复现实验，建议额外保存 Python、PyTorch、CUDA 和 scikit-image 的版本信息。
+- 每张图均衡采样；
+- 单一固定图块尺寸；
+- batch-size=2的张量堆叠；
+- 0.3 BCE + 0.3 Dice + 0.4 clDice前向和反向传播；
+- 滑窗预测；
+- Dice、clDice、Recall计算；
+- 1 px骨架化、反向填充和测量输出。
 
-## 数据准备
+## 数据划分和每轮采样
 
-默认数据目录为仓库内的 `data/`：
+当前数据大约有72张图。使用：
 
-```text
-data/
-├─ original/       # 训练 RGB 图像
-├─ mask/           # 人工标注的边界二值图
-├─ triplepoint/    # 三波点强度图
-└─ predict/        # 待预测图像
-```
+~~~text
+validation_fraction = 0.2
+~~~
 
-训练时，`original/`、`mask/` 和 `triplepoint/` 中的配对文件必须使用完全相同的文件名。支持扩展名：`.tif`、`.tiff`、`.png`、`.jpg`、`.jpeg`、`.bmp`。
+如果实际正好是72张，通常划分为：
 
-- 原图会转为 RGB。
-- `mask` 与 `triplepoint` 会转为灰度图。
-- `mask > 127` 被视为真实边界。
-- 尺寸不一致时，mask 使用最近邻插值，三波点图使用双线性插值。
-- 三波点图仅参与训练加权和重点采样，不是模型输入，推理阶段不需要。
-- mask 必须表示“边界线”，而不是胞格内部区域。
+~~~text
+训练图：58张
+验证图：14张
+~~~
 
-## 快速开始
+默认每个epoch生成580个训练块，全部是512×512：
 
-### 训练
+~~~text
+580 ÷ 58 = 每张训练图10块
+batch-size=2
+每个epoch约290次参数更新
+~~~
 
-```bash
-python train_plusresunet.py
-```
+如果实际训练图数量发生变化，均衡采样器仍会保证每张图的训练块数量
+最多只相差1次，并且每个新epoch会重新生成裁剪位置和额外样本分配。
 
-指定数据、输出目录和训练轮数：
+每个训练块的裁剪策略：
 
-```bash
-python train_plusresunet.py \
-  --data-dir /path/to/data \
-  --out-dir runs \
-  --folds 5 \
-  --epochs 100
-```
+- 70%概率在mask前景轨迹线附近裁剪；
+- 30%概率在整张图内随机裁剪；
+- 随机水平翻转和垂直翻转；
+- 随机旋转0°、90°、180°或270°；
+- 随机亮度和对比度变化；
+- 25%概率加入少量高斯噪声。
 
-仅使用 CPU：
+这里的70%表示前景引导裁剪概率，不再表示不同图块尺寸的比例。
 
-```bash
-python train_plusresunet.py --data-dir /path/to/data --cpu
-```
+## 损失函数
 
-训练会生成每折检查点及 `runs/best_model.pt`。最佳模型是综合 score 最高的单折模型，不是 5 折模型集成。
+损失按照要求原样计算：
 
-### 推理与尺寸测量
+~~~text
+total_loss =
+    0.3 × BCE
+  + 0.3 × DiceLoss
+  + 0.4 × clDiceLoss
+~~~
 
-使用仓库附带权重和默认目录：
+三个权重相加为1.0，程序直接使用这组权重。clDice默认执行10次可微骨架迭代：
 
-```bash
-python predict_plusresunet.py
-```
+~~~text
+cldice_iterations = 10
+~~~
 
-指定路径与标定比例：
+### 为什么引入 clDice
 
-```bash
-python predict_plusresunet.py \
-  --data-dir /path/to/data \
-  --model weights/best_model.pt \
-  --out-dir outputs \
-  --pixel-per-mm 8.4
-```
+常规 Dice 主要衡量区域重叠，一条很细的轨迹线即使在局部断裂，像素级分数也可能只发生较小变化；但对爆轰胞格而言，这种断裂会直接改变闭合结构数量和尺寸测量。
 
-只处理部分图像：
-
-```bash
-python predict_plusresunet.py --image-glob "*.tif" --max-images 10
-```
-
-## 实现逻辑
-
-### 1. 监督图构造
-
-训练脚本从硬边界 mask 与三波点图构造七类信息：
-
-| 名称 | 生成方式 | 用途 |
-| --- | --- | --- |
-| `mask` | `mask > 127` | BCE 与 Focal Tversky 的硬标签 |
-| `soft_mask` | 边界及两级膨胀带 | Soft Dice 的软标签 |
-| `triple` | 三波点灰度归一化到 `[0,1]` | 空间权重 |
-| `line_band` | 边界骨架膨胀 | 空间权重、重点采样 |
-| `connection` | `line_band ∩ triple_neighborhood` | 强调三波点附近连接 |
-| `triple_neighborhood` | 三波点阈值化后膨胀 | 决定重点采样位置 |
-| `interior` | 边界屏障内的闭合区域 | 抑制胞格内部假阳性 |
-
-软边界默认取值为：真实边界 `1.00`、近邻膨胀带 `0.55`、外层膨胀带 `0.25`、其余区域 `0.00`。
-
-### 2. 混合 Patch 采样与增强
-
-每张训练图默认产生 70 个 `256×256` patch 和 30 个 `512×512` patch。以 `focus_prob=0.7` 的概率在边界、三波点邻域或连接区域附近采样，其余情况随机裁剪。
-
-训练增强包括随机水平/垂直翻转、0°/90°/180°/270° 旋转，以及 30% 概率的轻微亮度和对比度扰动。
-
-### 3. PlusResUNet 结构
-
-每个 `ResidualBlock` 包含两个 `3×3 Conv + BatchNorm`。输入输出通道不同时，捷径分支使用 `1×1 Conv`；否则使用恒等映射。
-
-| 阶段 | 默认输出通道 | 相对分辨率 |
-| --- | ---: | ---: |
-| Encoder 1 | 32 | 1 |
-| Encoder 2 | 64 | 1/2 |
-| Encoder 3 | 128 | 1/4 |
-| Encoder 4 | 256 | 1/8 |
-| Bottleneck | 512 | 1/16 |
-| Decoder 4 | 256 | 1/8 |
-| Decoder 3 | 128 | 1/4 |
-| Decoder 2 | 64 | 1/2 |
-| Decoder 1 | 32 | 1 |
-| Output | 1 | 1 |
-
-下采样使用最大池化，上采样使用转置卷积；解码器与同尺度编码器特征按通道拼接。输出为单通道 logits，Sigmoid 在损失与推理阶段执行。
-
-### 4. 复合 BoundaryLoss
-
-空间权重为：
+clDice 由 **Suprosanna Shit、Johannes C. Paetzold 等人**提出，同时比较“预测骨架是否落在真值内”和“真值骨架是否被预测覆盖”：
 
 $$
-w=1+\lambda_t\,\text{triple}+\lambda_c\,\text{connection}+\lambda_l\,\text{line\_band}.
+T_{prec}=\frac{|S(P)\cap V_L|}{|S(P)|},\qquad
+T_{sens}=\frac{|S(L)\cap V_P|}{|S(L)|},
 $$
 
-默认 `λt=1`、`λc=2`、`λl=1`。BCE 还对正边界像素施加 `1.3×` 权重。总损失为：
-
 $$
-L=0.8L_{\mathrm{BCE}}+0.8L_{\mathrm{FocalTversky}}
-+0.35L_{\mathrm{SoftDice}}+0.35L_{\mathrm{InteriorFP}}.
+clDice=\frac{2T_{prec}T_{sens}}{T_{prec}+T_{sens}}.
 $$
 
-- 加权 BCE：保证逐像素二分类稳定训练。
-- Focal Tversky：平衡 FP/FN，默认 `α=0.45`、`β=0.55`、`γ=0.75`。
-- Soft Dice：允许边界附近存在有限的空间误差。
-- Interior FP：直接惩罚真实胞格内部的多余纹理和伪支线。
+其中 $P$ 和 $L$ 分别为预测与标签，$S(\cdot)$ 表示骨架化，$V$ 表示二值区域。训练阶段使用可微的 soft skeletonization，从而将连通性信息反向传播到网络。本实现默认进行 10 次 soft-skeleton 迭代，并给 clDice 分配最高的 0.4 损失权重。
 
-这四项的组合、空间权重、软标签和 Interior FP 是本项目的定制设计。
+方法来源及完整作者信息见文末[参考文献](#参考文献)。
 
-### 5. 交叉验证与模型选择
+history.csv记录：
 
-- 按原图做 K 折划分，同一图像的 patch 不会跨训练/验证集合。
-- 使用 AdamW 与 CosineAnnealingLR。
-- 每折只保留 score 最佳的检查点。
-- 所有折结束后，将最佳单折检查点复制为 `best_model.pt`。
+~~~text
+train_loss / val_loss
+train_bce_loss / val_bce_loss
+train_dice_loss / val_dice_loss
+train_cldice_loss / val_cldice_loss
+train_soft_cldice / val_soft_cldice
+train_dice / val_dice
+train_iou / val_iou
+train_precision / val_precision
+train_recall / val_recall
+learning_rate
+~~~
 
-### 6. 滑窗推理与后处理
+## 训练命令
 
-1. 图像补齐到 patch 大小的整数倍。
-2. 默认用 `512×512` patch、160 像素重叠滑窗预测。
-3. 重叠区域概率取算术平均。
-4. 概率增强、可选高斯平滑、迟滞/硬阈值二值化。
-5. 闭运算、填小孔、开运算和小对象移除。
-6. medial axis 或 skeletonize 骨架化，并剪除连接到分叉点的短枝。
-7. 将骨架膨胀为屏障，只保留不接触图像边界的闭合区域。
-8. 按真实面积过滤、连通域编号并输出测量结果。
+~~~bash
+conda activate SKESEG
+cd $HOME/CR/plusresunet
 
-### 7. 尺寸换算
+CUDA_VISIBLE_DEVICES=0 python -u train.py \
+  --data-root $HOME/CR/train \
+  --output-dir $HOME/CR/plusresunet/runs/resunet_cl \
+  --device cuda \
+  --epochs 100 \
+  --batch-size 2 \
+  --patch-size 512 \
+  --samples-per-epoch 580 \
+  --validation-samples 128 \
+  --validation-fraction 0.2 \
+  --foreground-probability 0.7 \
+  --base-channels 32 \
+  --learning-rate 0.001 \
+  --weight-decay 0.0001 \
+  --bce-weight 0.3 \
+  --dice-weight 0.3 \
+  --cldice-weight 0.4 \
+  --cldice-iterations 10 \
+  --threshold 0.2 \
+  --num-workers 2 \
+  --patience 20 \
+  --seed 42
+~~~
 
-$$
-H_{mm}=\frac{H_{px}}{r},\qquad
-W_{mm}=\frac{W_{px}}{r},\qquad
-A_{mm^2}=\frac{A_{px}}{r^2},
-$$
+只允许使用物理GPU 0，因此命令必须保留：
 
-其中 `r = pixel_per_mm`。上下和左右尺寸来自轴对齐外接框，不是旋转最小外接矩形、主轴长度或曲线长度。
+~~~text
+CUDA_VISIBLE_DEVICES=0
+~~~
 
-## 训练参数
+训练输出：
 
-| 参数 | 默认值 | 说明 |
-| --- | ---: | --- |
-| `--data-dir` | `data` | 数据根目录 |
-| `--out-dir` | `runs` | 检查点输出目录 |
-| `--folds` | `5` | 图像级交叉验证折数 |
-| `--epochs` | `100` | 每折训练轮数 |
-| `--batch-size-256` | `6` | 256 patch 的 batch size |
-| `--batch-size-512` | `2` | 512 patch 的 batch size |
-| `--patches-256-per-image` | `70` | 每图的 256 patch 数 |
-| `--patches-512-per-image` | `30` | 每图的 512 patch 数 |
-| `--base-channels` | `32` | 第一层基础通道数 |
-| `--lr` | `1e-3` | AdamW 初始学习率 |
-| `--weight-decay` | `1e-4` | AdamW 权重衰减 |
-| `--focus-prob` | `0.7` | 重点区域采样概率 |
-| `--soft-radius` | `2` | 软边界膨胀半径 |
-| `--line-radius` | `3` | 骨架带膨胀半径 |
-| `--triple-near-radius` | `64` | 三波点邻域半径 |
-| `--triple-threshold` | `0.2` | 三波点阈值 |
-| `--interior-barrier-radius` | `2` | 内部区屏障膨胀半径 |
-| `--interior-min-area` | `128` | 内部区最小像素面积 |
-| `--bce-loss-weight` | `0.8` | BCE 项系数 |
-| `--focal-tversky-loss-weight` | `0.8` | Focal Tversky 项系数 |
-| `--soft-dice-loss-weight` | `0.35` | Soft Dice 项系数 |
-| `--interior-fp-loss-weight` | `0.35` | Interior FP 项系数 |
-| `--positive-weight` | `1.3` | BCE 正边界额外权重 |
-| `--triple-point-weight` | `1.0` | 三波点空间权重 |
-| `--connection-weight` | `2.0` | 连接区空间权重 |
-| `--line-weight` | `1.0` | 骨架带空间权重 |
-| `--tversky-alpha` | `0.45` | Tversky FP 权重 |
-| `--tversky-beta` | `0.55` | Tversky FN 权重 |
-| `--tversky-gamma` | `0.75` | Focal 指数 |
-| `--threshold` | `0.5` | 验证二值化高阈值 |
-| `--low-threshold` | `0.2` | 写入检查点的低阈值 |
-| `--workers` | `0` | DataLoader worker 数 |
-| `--seed` | `2026` | Python/NumPy/PyTorch 随机种子 |
-| `--cpu` | 关闭 | 强制使用 CPU |
+~~~text
+best.pt
+last.pt
+history.csv
+split.json
+config.json
+sampling_plan_epoch_001.json
+~~~
 
-## 推理参数
+sampling_plan_epoch_001.json记录第一轮每张训练图获得的512训练块数量，
+可以用来核对是否均衡。
 
-| 参数 | 默认值 | 说明 |
-| --- | ---: | --- |
-| `--data-dir` | `data` | 从 `<data-dir>/predict` 读取图像 |
-| `--model` | `weights/best_model.pt` | 检查点路径 |
-| `--out-dir` | `outputs` | 推理输出目录 |
-| `--patch-size` | `512` | 滑窗 patch 大小 |
-| `--overlap` | `160` | 相邻 patch 重叠像素 |
-| `--threshold` | 检查点值 | 高阈值；检查点默认 0.5 |
-| `--low-threshold` | 检查点值 | 迟滞低阈值；检查点默认 0.2 |
-| `--white-boost` | `1.05` | 概率增强指数 |
-| `--smooth-sigma` | `0.4` | 高斯平滑 sigma |
-| `--binarize-mode` | `hysteresis` | `hysteresis` 或 `hard` |
-| `--min-line-area` | `24` | 最小边界对象像素数 |
-| `--pre-skeleton-close-radius` | `2` | 骨架化前闭运算半径 |
-| `--pre-skeleton-open-radius` | `1` | 骨架化前开运算半径 |
-| `--pre-skeleton-hole-area` | `96` | 填充的小孔面积阈值 |
-| `--skeleton-method` | `medial` | `medial` 或 `skeletonize` |
-| `--medial-min-distance` | `1.5` | medial axis 最小距离 |
-| `--spur-prune-length` | `28` | 最大短枝长度 |
-| `--spur-prune-iterations` | `4` | 短枝剪除迭代次数 |
-| `--barrier-radius` | `1` | 骨架屏障膨胀半径 |
-| `--min-area-mm2` | `5.0` | 闭合结构最小真实面积 |
-| `--pixel-per-mm` | `8.4` | 像素/毫米标定比例 |
-| `--image-glob` | 空 | 文件名筛选模式 |
-| `--max-images` | `0` | 最大图像数；0 表示不限 |
-| `--cpu` | 关闭 | 强制使用 CPU |
+### 当前最佳模型保存依据
 
-## 输出说明
+best.pt目前依据验证集整体Dice保存：
 
-| 目录/文件 | 内容 |
-| --- | --- |
-| `binary_mask/` | 阈值化后的边界二值图 |
-| `probability/` | 网络原始概率图 |
-| `probability_boosted/` | 增强和平滑后的概率图 |
-| `cleaned_mask/` | 形态学清理后的边界图 |
-| `skeleton_raw/` | 剪枝前骨架 |
-| `skeleton_1px/` | 剪枝后单像素骨架 |
-| `structure_id/` | `uint16` 闭合结构编号 TIFF |
-| `colored_mask/` | 随机着色并标注 ID 的结构图 |
-| `overlay/` | 原图、边界、结构颜色与 ID 的叠加图 |
-| `measurements/` | 每张图的结构测量 CSV |
-| `all_measurements.csv` | 所有有效结构的汇总 CSV |
+~~~text
+prediction = sigmoid(logits) >= 0.2
+val_dice = 2TP / (predicted_positive + actual_positive)
+~~~
 
-测量字段包括 `id`、`top_to_bottom_mm`、`left_to_right_mm`、`height_width_ratio` 和 `area_mm2`；汇总 CSV 额外包含 `image`。
+当本轮val_dice严格高于历史最佳值时覆盖best.pt。soft-clDice会写入日志和
+checkpoint，但目前不决定best.pt。学习率调度和早停也监控val_dice。
 
-## 已知限制
+## 无真值的真实预测
 
-- 验证集使用随机 patch；每个 epoch 的验证裁剪位置可能不同。
-- 当前发布结果没有独立测试集标签，因此没有报告独立测试集 Dice/Precision/Recall。
-- 闭合结构数量对阈值、闭运算、短枝剪除和屏障半径较敏感。
-- 图像边界上的开放结构会被 `clear_border` 移除。
-- 真实尺寸完全依赖正确的 `pixel_per_mm` 标定。
-- 全部训练图像和完整中间输出未包含在仓库中。
-- `uint16` 编号图最多无歧义表示 65535 个标签。
+predict目录通常没有对应mask，因此Dice、clDice和Recall无法计算。程序仍然
+输出完整预测、闭合结构和几何结果，监督指标记录为NaN。
 
-## 参考资料
+~~~bash
+conda activate SKESEG
+cd $HOME/CR/plusresunet
 
-1. Ronneberger, O., Fischer, P., & Brox, T. [U-Net: Convolutional Networks for Biomedical Image Segmentation](https://arxiv.org/abs/1505.04597).
-2. He, K., Zhang, X., Ren, S., & Sun, J. [Deep Residual Learning for Image Recognition](https://arxiv.org/abs/1512.03385).
-3. Milletari, F., Navab, N., & Ahmadi, S.-A. [V-Net: Fully Convolutional Neural Networks for Volumetric Medical Image Segmentation](https://arxiv.org/abs/1606.04797).
-4. Salehi, S. S. M., Erdogmus, D., & Gholipour, A. [Tversky loss function for image segmentation using 3D fully convolutional deep networks](https://arxiv.org/abs/1706.05721).
-5. Abraham, N., & Khan, N. M. [A Novel Focal Tversky Loss Function with Improved Attention U-Net for Lesion Segmentation](https://arxiv.org/abs/1810.07842).
-6. PyTorch. [BCEWithLogitsLoss documentation](https://docs.pytorch.org/docs/stable/generated/torch.nn.BCEWithLogitsLoss.html).
+CUDA_VISIBLE_DEVICES=0 python -u predict.py \
+  --checkpoint $HOME/CR/plusresunet/runs/resunet_cl/best.pt \
+  --data-root $HOME/CR/train \
+  --input-dir $HOME/CR/train/predict \
+  --output-dir $HOME/CR/plusresunet/predict_results_resunet_cl \
+  --device cuda \
+  --tile-size 512 \
+  --overlap 128 \
+  --batch-size 2 \
+  --threshold 0.2 \
+  --pixels-per-mm 8.4
+~~~
 
-## 致谢与说明
+## 带真值的逐图评估
 
-本仓库用于研究与工程复现。若用于论文、报告或生产流程，请重新核对数据许可、标定方法、独立测试集表现和运行环境。仓库目前未附加开源许可证；在许可证明确前，默认保留全部权利。
+Dice、clDice、Recall等监督指标必须提供与输入图同名、空间对齐的mask。
+可以先在已有原图和mask上评估：
+
+~~~bash
+CUDA_VISIBLE_DEVICES=0 python -u predict.py \
+  --checkpoint $HOME/CR/plusresunet/runs/resunet_cl/best.pt \
+  --data-root $HOME/CR/train \
+  --input-dir $HOME/CR/train/original \
+  --ground-truth-dir $HOME/CR/train/mask \
+  --output-dir $HOME/CR/plusresunet/predict_results_resunet_cl_eval \
+  --device cuda \
+  --tile-size 512 \
+  --overlap 128 \
+  --batch-size 2 \
+  --threshold 0.2 \
+  --pixels-per-mm 8.4
+~~~
+
+逐图指标分为两组：
+
+~~~text
+raw_*       阈值二值化后、后处理前
+cleaned_*   去小连通域和闭运算后
+~~~
+
+主要指标：
+
+~~~text
+dice
+cldice
+iou
+precision
+recall
+specificity
+accuracy
+balanced_accuracy
+true_positive_px
+false_positive_px
+false_negative_px
+true_negative_px
+~~~
+
+每张图保存metrics.csv，总目录保存：
+
+~~~text
+all_metrics.csv
+all_metrics.xlsx
+all_summary.csv
+all_measurements.csv
+all_measurements.xlsx
+~~~
+
+## 每张图的预测输出
+
+~~~text
+probability_uint16.tif
+binary_mask.tif
+cleaned_mask.tif
+skeleton_1px.tif
+closed_structure_ids.tif
+closed_structures_color.png
+closed_structures_overlay.png
+measurements.csv
+summary.csv
+metrics.csv
+~~~
+
+后处理默认参数：
+
+~~~text
+threshold             = 0.2
+pixels_per_mm         = 8.4
+closing_kernel        = 3
+min_line_component_px = 20
+min_closed_area_px    = 50
+~~~
+
+尺度换算：
+
+~~~text
+top_to_bottom_mm = top_to_bottom_px / 8.4
+left_to_right_mm = left_to_right_px / 8.4
+area_mm2         = area_px2 / (8.4²)
+perimeter_mm     = perimeter_px / 8.4
+~~~
+
+## 可视化结果
+
+仓库附带两组完整推理输出，不只包含展示用 PNG，也保留了概率图、二值图、清理结果、1 px 骨架、结构 ID 图和 CSV 测量表。
+
+### `1-negative`
+
+该样例检出 106 个闭合结构。
+
+![1-negative 闭合结构叠加结果](examples/1-negative/closed_structures_overlay.png)
+
+- [完整结果目录](examples/1-negative)
+- [彩色结构图](examples/1-negative/closed_structures_color.png)
+- [结构测量表](examples/1-negative/measurements.csv)
+
+### `64`
+
+该样例检出 86 个闭合结构。原始文件名为 `64-C2H2-2.5O2-65%Ar-7.50kPa-1_gamma0p6_CLAHEclip01_GBlur05_GNoise10.tif`。
+
+![64 闭合结构叠加结果](examples/64/closed_structures_overlay.png)
+
+- [完整结果目录](examples/64)
+- [彩色结构图](examples/64/closed_structures_color.png)
+- [结构测量表](examples/64/measurements.csv)
+
+这两组数据没有提供空间对齐的真值 mask，因此 `metrics.csv` 中的 Dice、clDice 和 Recall 等监督指标为空值；不应将空值解读为 0 分。
+
+## 注意事项
+
+当前已知1.tif原图和mask尺寸不一致。程序会使用最近邻插值把mask调整到
+原图尺寸，但这不能保证标注在空间上真正对齐。细轨迹线对错位非常敏感，
+正式比较模型前建议人工复查该标注。
+
+## 参考文献
+
+1. Suprosanna Shit, Johannes C. Paetzold, Anjany Sekuboyina, Ivan Ezhov, Alexander Unger, Andrey Zhylka, Josien P. W. Pluim, Ulrich Bauer, and Bjoern H. Menze. [*clDice - A Novel Topology-Preserving Loss Function for Tubular Structure Segmentation*](https://openaccess.thecvf.com/content/CVPR2021/html/Shit_clDice_-_A_Novel_Topology-Preserving_Loss_Function_for_Tubular_Structure_CVPR_2021_paper.html). CVPR, 2021, pp. 16560–16569. DOI: [10.1109/CVPR46437.2021.01629](https://doi.org/10.1109/CVPR46437.2021.01629).
+2. Olaf Ronneberger, Philipp Fischer, and Thomas Brox. [*U-Net: Convolutional Networks for Biomedical Image Segmentation*](https://arxiv.org/abs/1505.04597). MICCAI, 2015.
+3. Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. [*Deep Residual Learning for Image Recognition*](https://arxiv.org/abs/1512.03385). CVPR, 2016.
+

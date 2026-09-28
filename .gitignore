@@ -18,6 +18,9 @@ venv/
 /runs/
 /outputs/
 /ooutputs/
+/quick_test_output/
+/predict_results_resunet_cl/
+/predict_results_resunet_cl_eval/
 
 # Accidental nested copy of this project
 /plusresunet/

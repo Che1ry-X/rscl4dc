@@ -1,4 +1,10 @@
-torch
-numpy
-pillow
-scikit-image
+# Target environment: Python 3.7.16, PyTorch 1.2.0, CUDA 10.0
+# PyTorch is supplied by the existing SKESEG conda environment; do not reinstall it here.
+numpy==1.21.6
+Pillow==9.4.0
+opencv-python-headless==4.7.0.72
+scipy==1.7.3
+scikit-image==0.19.3
+pandas==1.3.5
+openpyxl==3.0.10
+tqdm==4.68.2
